@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#000" />
+  <title>Infoscreen</title>
+  <style>
+    html, body {
+      margin: 0; height: 100%; background: #000; color: #fff;
+      overflow: hidden; font-family: system-ui, sans-serif;
+    }
+    #stage {
+      position: fixed; inset: 0; background: #000;
+    }
+    .slide {
+      position: absolute; inset: 0;
+      opacity: 0;
+      transition: opacity var(--t, 800ms) ease-in-out;
+      display: flex; align-items: center; justify-content: center;
+      background: #000;
+    }
+    .slide.active { opacity: 1; z-index: 2; }
+    .slide.prev { opacity: 0; z-index: 1; }
+    .slide img, .slide video {
+      width: 100%; height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+    #status {
+      position: fixed; left: 12px; bottom: 10px; z-index: 10;
+      font-size: 12px; opacity: 0.35; pointer-events: none;
+    }
+    #status.error { opacity: 0.9; color: #fca5a5; }
+    #placeholder {
+      position: absolute; inset: 0; display: none;
+      align-items: center; justify-content: center;
+      flex-direction: column; gap: 12px; color: #64748b;
+      font-size: 28px;
+    }
+    #placeholder.show { display: flex; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="a" class="slide"></div>
+    <div id="b" class="slide"></div>
+    <div id="placeholder">Ingen media</div>
+  </div>
+  <div id="status">Laster…</div>
+  <script>
+(function () {
+  const PLAYLIST_URL = "playlist.json";
+  const REFRESH_MS = 60_000;
+  const $ = (id) => document.getElementById(id);
+  const status = $("status");
+  const placeholder = $("placeholder");
+  const layers = [$("a"), $("b")];
+  let front = 0;
+  let items = [];
+  let index = 0;
+  let timer = null;
+  let transitionMs = 800;
+  let defaultDurationSec = 10;
+  let playlistVersion = null;
+
+  function setStatus(msg, isError) {
+    status.textContent = msg || "";
+    status.classList.toggle("error", !!isError);
+  }
+
+  function clearLayer(el) {
+    el.innerHTML = "";
+    el.classList.remove("active", "prev");
+  }
+
+  function mediaEl(item) {
+    if (item.type === "video") {
+      const v = document.createElement("video");
+      v.src = item.url;
+      v.muted = true;
+      v.playsInline = true;
+      v.autoplay = true;
+      v.setAttribute("playsinline", "");
+      v.setAttribute("muted", "");
+      return v;
+    }
+    const img = document.createElement("img");
+    img.src = item.url;
+    img.alt = item.alt || "";
+    img.decoding = "async";
+    return img;
+  }
+
+  function showPlaceholder(on) {
+    placeholder.classList.toggle("show", on);
+  }
+
+  function durationFor(item) {
+    if (item.type === "video") return null; // driven by ended
+    const d = item.durationSec != null ? item.durationSec : defaultDurationSec;
+    return Math.max(2, Number(d) || defaultDurationSec) * 1000;
+  }
+
+  function goTo(nextIndex) {
+    if (!items.length) return;
+    index = ((nextIndex % items.length) + items.length) % items.length;
+    const item = items[index];
+    const next = 1 - front;
+    const outEl = layers[front];
+    const inEl = layers[next];
+
+    clearLayer(inEl);
+    const media = mediaEl(item);
+    inEl.appendChild(media);
+    inEl.style.setProperty("--t", transitionMs + "ms");
+    outEl.style.setProperty("--t", transitionMs + "ms");
+
+    // force reflow then crossfade
+    void inEl.offsetWidth;
+    outEl.classList.remove("active");
+    outEl.classList.add("prev");
+    inEl.classList.add("active");
+    inEl.classList.remove("prev");
+    front = next;
+
+    if (timer) { clearTimeout(timer); timer = null; }
+
+    if (item.type === "video") {
+      const v = media;
+      const onEnded = () => { v.removeEventListener("ended", onEnded); goTo(index + 1); };
+      v.addEventListener("ended", onEnded);
+      const p = v.play();
+      if (p && p.catch) p.catch(() => { timer = setTimeout(() => goTo(index + 1), 5000); });
+    } else {
+      const ms = durationFor(item);
+      timer = setTimeout(() => goTo(index + 1), ms);
+    }
+    setStatus((index + 1) + "/" + items.length + " · " + (item.alt || item.url));
+  }
+
+  async function loadPlaylist(force) {
+    try {
+      const res = await fetch(PLAYLIST_URL + "?t=" + Date.now(), { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      if (!force && data.version != null && data.version === playlistVersion && items.length) return;
+      playlistVersion = data.version != null ? data.version : Date.now();
+      transitionMs = Number(data.transitionMs) || 800;
+      defaultDurationSec = Number(data.defaultDurationSec) || 10;
+      const nextItems = Array.isArray(data.items) ? data.items.filter(i => i && i.url && (i.type === "image" || i.type === "video")) : [];
+      if (!nextItems.length) {
+        items = [];
+        showPlaceholder(true);
+        setStatus("Tom spilliste", true);
+        return;
+      }
+      showPlaceholder(false);
+      items = nextItems;
+      if (!layers[front].classList.contains("active")) goTo(0);
+      else setStatus(items.length + " elementer lastet");
+    } catch (e) {
+      if (!items.length) {
+        showPlaceholder(true);
+        setStatus("Kunne ikke laste playlist.json — " + (e.message || e), true);
+      } else {
+        setStatus("Beholder forrige spilliste (" + (e.message || e) + ")", true);
+      }
+    }
+  }
+
+  // Wake lock when available (keeps screen on in some browsers)
+  async function tryWakeLock() {
+    try {
+      if (navigator.wakeLock) await navigator.wakeLock.request("screen");
+    } catch (_) {}
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") tryWakeLock();
+  });
+
+  loadPlaylist(true).then(() => {
+    if (items.length) goTo(0);
+  });
+  setInterval(() => loadPlaylist(false), REFRESH_MS);
+  tryWakeLock();
+
+  // Tap/click advances (handy while testing)
+  document.body.addEventListener("click", () => {
+    if (items.length) goTo(index + 1);
+  });
+})();
+  </script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "title": "Infoscreen demo",
+  "defaultDurationSec": 8,
+  "transition": "crossfade",
+  "transitionMs": 800,
+  "items": [
+    {
+      "type": "image",
+      "url": "media/slide-1.svg",
+      "durationSec": 8,
+      "alt": "Welcome"
+    },
+    {
+      "type": "image",
+      "url": "media/slide-2.svg",
+      "durationSec": 8,
+      "alt": "Next up"
+    },
+    {
+      "type": "image",
+      "url": "media/slide-3.svg",
+      "durationSec": 8,
+      "alt": "Info"
+    }
+  ]
+}
