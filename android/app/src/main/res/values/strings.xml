@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Infoscreen</string>
+    <string name="settings_title">Infoscreen feed URL</string>
+    <string name="settings_hint">The page shown full screen on this TV</string>
+    <string name="settings_url_hint">https://…</string>
+    <string name="settings_save">Save</string>
+    <string name="settings_reset">Use default</string>
+    <string name="settings_cancel">Cancel</string>
+    <string name="settings_invalid_url">Enter an http:// or https:// address</string>
+    <string name="settings_footer">Open this screen again: hold OK for 2 seconds, or press Menu</string>
+</resources>
