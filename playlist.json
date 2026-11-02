@@ -1,27 +1,38 @@
 {
-  "version": 1,
-  "title": "Infoscreen demo",
-  "defaultDurationSec": 8,
+  "version": 2,
+  "title": "Oasenkirka infoscreen test",
+  "defaultDurationSec": 12,
   "transition": "crossfade",
   "transitionMs": 800,
   "items": [
     {
       "type": "image",
-      "url": "media/slide-1.svg",
-      "durationSec": 8,
-      "alt": "Velkommen"
+      "url": "media/alive-pizza.jpg",
+      "durationSec": 12,
+      "alt": "Alive Pizza"
     },
     {
       "type": "image",
-      "url": "media/slide-2.svg",
-      "durationSec": 8,
-      "alt": "Neste"
+      "url": "media/bonn-for-bygda.png",
+      "durationSec": 12,
+      "alt": "Bønn for Bygda HØSTEN 2026"
     },
     {
       "type": "image",
-      "url": "media/slide-3.svg",
-      "durationSec": 8,
-      "alt": "Info"
+      "url": "media/sprudle-barnekor.webp",
+      "durationSec": 12,
+      "alt": "Sprudle barnekor"
+    },
+    {
+      "type": "image",
+      "url": "media/taler-oversettelse.png",
+      "durationSec": 12,
+      "alt": "Taler Oversettelse"
+    },
+    {
+      "type": "video",
+      "url": "media/oasenkirka-promo.mp4",
+      "alt": "Oasenkirka promo uke 45-46"
     }
   ]
 }
