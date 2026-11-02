@@ -9,13 +9,13 @@
       "type": "image",
       "url": "media/slide-1.svg",
       "durationSec": 8,
-      "alt": "Welcome"
+      "alt": "Velkommen"
     },
     {
       "type": "image",
       "url": "media/slide-2.svg",
       "durationSec": 8,
-      "alt": "Next up"
+      "alt": "Neste"
     },
     {
       "type": "image",
