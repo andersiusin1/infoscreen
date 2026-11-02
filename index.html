@@ -4,192 +4,395 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#000" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <title>Infoscreen</title>
   <style>
     html, body {
       margin: 0; height: 100%; background: #000; color: #fff;
-      overflow: hidden; font-family: system-ui, sans-serif;
+      overflow: hidden; cursor: none;
+      font-family: system-ui, Roboto, sans-serif;
+      -webkit-user-select: none; user-select: none;
+      -webkit-tap-highlight-color: transparent;
     }
-    #stage {
-      position: fixed; inset: 0; background: #000;
+    body.debug { cursor: default; }
+    /* top/right/bottom/left instead of `inset`: older Android TV browsers lack it */
+    #stage, .layer, #placeholder { position: absolute; top: 0; right: 0; bottom: 0; left: 0; }
+    #stage { position: fixed; background: #000; }
+    .layer {
+      z-index: 1; opacity: 0;
+      transition-property: opacity;
+      transition-timing-function: ease-in-out;
+      will-change: opacity;
     }
-    .slide {
-      position: absolute; inset: 0;
-      opacity: 0;
-      transition: opacity var(--t, 800ms) ease-in-out;
-      display: flex; align-items: center; justify-content: center;
-      background: #000;
-    }
-    .slide.active { opacity: 1; z-index: 2; }
-    .slide.prev { opacity: 0; z-index: 1; }
-    .slide img, .slide video {
-      width: 100%; height: 100%;
+    .layer.top { z-index: 2; }
+    .layer.on { opacity: 1; }
+    .layer img, .layer video {
+      display: block; width: 100%; height: 100%;
       object-fit: contain;
-      background: #000;
+      background: #000; /* opaque letterbox, so the incoming slide fully covers the outgoing one */
     }
-    #status {
-      position: fixed; left: 12px; bottom: 10px; z-index: 10;
-      font-size: 12px; opacity: 0.35; pointer-events: none;
-    }
-    #status.error { opacity: 0.9; color: #fca5a5; }
     #placeholder {
-      position: absolute; inset: 0; display: none;
+      z-index: 0; display: none;
       align-items: center; justify-content: center;
-      flex-direction: column; gap: 12px; color: #64748b;
-      font-size: 28px;
+      color: #2a2f38; font-size: 28px; letter-spacing: 0.08em;
     }
     #placeholder.show { display: flex; }
+    #status {
+      display: none;
+      position: fixed; left: 12px; bottom: 10px; z-index: 10;
+      font-size: 14px; opacity: 0.6; pointer-events: none;
+      text-shadow: 0 0 4px #000;
+    }
+    body.debug #status { display: block; }
+    #status.error { opacity: 0.9; color: #fca5a5; }
   </style>
 </head>
 <body>
   <div id="stage">
-    <div id="a" class="slide"></div>
-    <div id="b" class="slide"></div>
-    <div id="placeholder">Ingen media</div>
+    <div id="placeholder">Ingen innhold</div>
+    <div id="a" class="layer"></div>
+    <div id="b" class="layer"></div>
   </div>
   <div id="status">Laster…</div>
   <script>
 (function () {
+  "use strict";
+  // Plain ES2017 on purpose (no ?. / ?? / numeric separators): TV browsers can be old.
   const PLAYLIST_URL = "playlist.json";
-  const REFRESH_MS = 60_000;
+  const REFRESH_MS = 60000;
+  const FETCH_TIMEOUT_MS = 15000;
+  const LOAD_TIMEOUT_MS = 20000;
+  const STORAGE_KEY = "infoscreen.playlist";
+
+  const params = new URLSearchParams(location.search);
+  const DEBUG = params.has("debug");
+  const WAKE_LOCK = params.get("wakelock") !== "0";
+
   const $ = (id) => document.getElementById(id);
-  const status = $("status");
+  const statusEl = $("status");
   const placeholder = $("placeholder");
   const layers = [$("a"), $("b")];
-  let front = 0;
+
+  let front = 0;            // layers[front] is the one on screen
   let items = [];
-  let index = 0;
-  let timer = null;
+  let index = -1;
+  let transition = "crossfade";
   let transitionMs = 800;
   let defaultDurationSec = 10;
-  let playlistVersion = null;
+  let playlistSig = null;   // JSON of the applied playlist; null until one has been applied
+  let seq = 0;              // bumped on every navigation; async callbacks compare against it
+  let timer = null;
+  let cleanupTimer = null;
+  let failures = 0;
+  let loading = false;
+  let warm = {};            // url -> Image, keeps images in memory cache for offline use
+  let lastKeyAt = 0;
+
+  if (DEBUG) document.body.classList.add("debug");
 
   function setStatus(msg, isError) {
-    status.textContent = msg || "";
-    status.classList.toggle("error", !!isError);
+    statusEl.textContent = msg || "";
+    statusEl.classList.toggle("error", !!isError);
+    if (isError) console.warn("[infoscreen]", msg);
   }
 
-  function clearLayer(el) {
-    el.innerHTML = "";
-    el.classList.remove("active", "prev");
+  function num(v, min, max, fallback) {
+    if (v == null || v === "") return fallback;
+    const n = Number(v);
+    return isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
   }
 
-  function mediaEl(item) {
-    if (item.type === "video") {
-      const v = document.createElement("video");
-      v.src = item.url;
-      v.muted = true;
-      v.playsInline = true;
-      v.autoplay = true;
-      v.setAttribute("playsinline", "");
-      v.setAttribute("muted", "");
-      return v;
+  function normalize(data) {
+    if (!data || typeof data !== "object") throw new Error("playlist.json er ikke et objekt");
+    const list = Array.isArray(data.items) ? data.items : [];
+    return {
+      transition: data.transition === "fade" ? "fade" : "crossfade",
+      transitionMs: num(data.transitionMs, 0, 10000, 800),
+      defaultDurationSec: num(data.defaultDurationSec, 1, 86400, 10),
+      items: list
+        .filter((i) => i && typeof i.url === "string" && i.url && (i.type === "image" || i.type === "video"))
+        .map((i) => ({
+          type: i.type,
+          url: i.url,
+          durationSec: num(i.durationSec, 1, 86400, null),
+          alt: typeof i.alt === "string" ? i.alt : ""
+        }))
+    };
+  }
+
+  // ---- media ----
+
+  function releaseMedia(el) {
+    if (el && el.tagName === "VIDEO") {
+      el.pause();
+      el.removeAttribute("src");
+      try { el.load(); } catch (_) {} // frees the hardware decoder
     }
-    const img = document.createElement("img");
-    img.src = item.url;
-    img.alt = item.alt || "";
-    img.decoding = "async";
-    return img;
   }
 
-  function showPlaceholder(on) {
-    placeholder.classList.toggle("show", on);
+  function resetLayer(el) {
+    el.style.transitionDuration = "0ms";
+    el.style.transitionDelay = "0ms";
+    el.classList.remove("on", "top");
+    Array.prototype.forEach.call(el.children, releaseMedia);
+    el.textContent = "";
   }
 
-  function durationFor(item) {
-    if (item.type === "video") return null; // driven by ended
-    const d = item.durationSec != null ? item.durationSec : defaultDurationSec;
-    return Math.max(2, Number(d) || defaultDurationSec) * 1000;
+  // Resolves with a ready-to-show element, so fades never start on a blank frame.
+  function prepare(item) {
+    return new Promise((resolve, reject) => {
+      let el;
+      let done = false;
+      const t = setTimeout(() => fail(new Error("tidsavbrudd")), LOAD_TIMEOUT_MS);
+      function ok() { if (done) return; done = true; clearTimeout(t); resolve(el); }
+      function fail(err) { if (done) return; done = true; clearTimeout(t); releaseMedia(el); reject(err); }
+
+      if (item.type === "video") {
+        el = document.createElement("video");
+        el.muted = true;
+        el.defaultMuted = true;
+        el.playsInline = true;
+        el.setAttribute("muted", "");
+        el.setAttribute("playsinline", "");
+        el.preload = "auto";
+        el.addEventListener("loadeddata", ok, { once: true });
+        // Some TV browsers don't buffer before play(); don't wait for a first frame forever.
+        el.addEventListener("loadedmetadata", () => setTimeout(ok, 3000), { once: true });
+        el.addEventListener("error", () => fail(new Error("kan ikke spille video")), { once: true });
+      } else {
+        el = new Image();
+        el.alt = item.alt;
+        el.onload = () => (el.decode ? el.decode().catch(() => {}) : Promise.resolve()).then(ok);
+        el.onerror = () => fail(new Error("kan ikke laste bilde"));
+      }
+      el.src = item.url;
+    });
   }
 
-  function goTo(nextIndex) {
+  function warmImages() {
+    const keep = {};
+    items.forEach((it) => {
+      if (it.type !== "image") return;
+      const old = warm[it.url];
+      keep[it.url] = old && !(old.complete && !old.naturalWidth) ? old : Object.assign(new Image(), { src: it.url });
+    });
+    warm = keep;
+  }
+
+  // ---- playback ----
+
+  function durationMs(item) {
+    const sec = item.durationSec || defaultDurationSec;
+    return Math.max(sec * 1000, transitionMs + 1000);
+  }
+
+  function next(ms, my) {
+    clearTimeout(timer);
+    timer = setTimeout(() => { if (my === seq) go(index + 1); }, ms);
+  }
+
+  function go(i) {
+    const my = ++seq;
+    clearTimeout(timer);
     if (!items.length) return;
-    index = ((nextIndex % items.length) + items.length) % items.length;
+    index = ((i % items.length) + items.length) % items.length;
     const item = items[index];
-    const next = 1 - front;
+    prepare(item).then((media) => {
+      if (my !== seq) { releaseMedia(media); return; }
+      failures = 0;
+      present(media, item, my);
+    }, (err) => {
+      if (my !== seq) return;
+      failures++;
+      setStatus("Hopper over " + item.url + " (" + err.message + ")", true);
+      // Current slide stays up. Back off if nothing in the list loads (e.g. offline, cold cache).
+      next(failures >= items.length ? 15000 : 1000, my);
+    });
+  }
+
+  function present(media, item, my) {
+    const inEl = layers[1 - front];
     const outEl = layers[front];
-    const inEl = layers[next];
+    const fade = transition === "fade" && outEl.classList.contains("on");
+    const half = Math.round(transitionMs / 2);
 
-    clearLayer(inEl);
-    const media = mediaEl(item);
+    clearTimeout(cleanupTimer);
+    resetLayer(inEl);
     inEl.appendChild(media);
-    inEl.style.setProperty("--t", transitionMs + "ms");
-    outEl.style.setProperty("--t", transitionMs + "ms");
+    outEl.classList.remove("top");
+    inEl.classList.add("top");
+    void inEl.offsetWidth; // commit opacity 0 before starting the transition
 
-    // force reflow then crossfade
-    void inEl.offsetWidth;
-    outEl.classList.remove("active");
-    outEl.classList.add("prev");
-    inEl.classList.add("active");
-    inEl.classList.remove("prev");
-    front = next;
+    if (fade) {
+      // fade out to black, then in
+      outEl.style.transitionDelay = "0ms"; // left over from its own fade-in
+      outEl.style.transitionDuration = half + "ms";
+      outEl.classList.remove("on");
+      inEl.style.transitionDelay = half + "ms";
+      inEl.style.transitionDuration = (transitionMs - half) + "ms";
+    } else {
+      // crossfade: new layer fades in on top while the old one stays fully visible underneath
+      inEl.style.transitionDuration = transitionMs + "ms";
+    }
+    inEl.classList.add("on");
+    front = 1 - front;
+    placeholder.classList.remove("show");
+    cleanupTimer = setTimeout(() => resetLayer(outEl), transitionMs + 100);
 
-    if (timer) { clearTimeout(timer); timer = null; }
-
+    const startDelay = fade ? half : 0;
     if (item.type === "video") {
       const v = media;
-      const onEnded = () => { v.removeEventListener("ended", onEnded); goTo(index + 1); };
-      v.addEventListener("ended", onEnded);
-      const p = v.play();
-      if (p && p.catch) p.catch(() => { timer = setTimeout(() => goTo(index + 1), 5000); });
+      const onDone = () => { if (my === seq) go(index + 1); };
+      v.addEventListener("ended", onDone);
+      v.addEventListener("error", onDone);
+      setTimeout(() => {
+        if (my !== seq) return;
+        const p = v.play();
+        if (p && p.catch) p.catch(() => next(durationMs(item), my));
+      }, startDelay);
+      // Watchdog in case "ended" never fires; durationSec on a video caps its play time.
+      const cap = item.durationSec ? item.durationSec * 1000
+        : isFinite(v.duration) ? v.duration * 1000 + 5000 : 600000;
+      next(cap + startDelay, my);
     } else {
-      const ms = durationFor(item);
-      timer = setTimeout(() => goTo(index + 1), ms);
+      next(durationMs(item), my);
     }
     setStatus((index + 1) + "/" + items.length + " · " + (item.alt || item.url));
   }
 
-  async function loadPlaylist(force) {
-    try {
-      const res = await fetch(PLAYLIST_URL + "?t=" + Date.now(), { cache: "no-store" });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json();
-      if (!force && data.version != null && data.version === playlistVersion && items.length) return;
-      playlistVersion = data.version != null ? data.version : Date.now();
-      transitionMs = Number(data.transitionMs) || 800;
-      defaultDurationSec = Number(data.defaultDurationSec) || 10;
-      const nextItems = Array.isArray(data.items) ? data.items.filter(i => i && i.url && (i.type === "image" || i.type === "video")) : [];
-      if (!nextItems.length) {
-        items = [];
-        showPlaceholder(true);
-        setStatus("Tom spilliste", true);
-        return;
-      }
-      showPlaceholder(false);
-      items = nextItems;
-      if (!layers[front].classList.contains("active")) goTo(0);
-      else setStatus(items.length + " elementer lastet");
-    } catch (e) {
-      if (!items.length) {
-        showPlaceholder(true);
-        setStatus("Kunne ikke laste playlist.json — " + (e.message || e), true);
-      } else {
-        setStatus("Beholder forrige spilliste (" + (e.message || e) + ")", true);
-      }
-    }
+  function step(d) {
+    if (items.length) go(index + d);
   }
 
-  // Wake lock when available (keeps screen on in some browsers)
-  async function tryWakeLock() {
+  // ---- playlist ----
+
+  function apply(pl) {
+    const sig = JSON.stringify(pl);
+    if (sig === playlistSig) return;
+    playlistSig = sig;
+    transition = pl.transition;
+    transitionMs = pl.transitionMs;
+    defaultDurationSec = pl.defaultDurationSec;
+    const current = items[index];
+    const wasRunning = items.length > 0;
+    items = pl.items;
+
+    if (!items.length) {
+      seq++;
+      clearTimeout(timer);
+      clearTimeout(cleanupTimer);
+      layers.forEach(resetLayer);
+      index = -1;
+      placeholder.classList.add("show");
+      setStatus("Tom spilliste");
+      return;
+    }
+    const keep = current
+      ? items.findIndex((it) => it.url === current.url && it.type === current.type)
+      : -1;
+    if (wasRunning && keep >= 0) index = keep; // carry on from the same item in the new list
+    else go(0);                                // first load, or the item on screen was removed
+  }
+
+  function readSaved() {
     try {
-      if (navigator.wakeLock) await navigator.wakeLock.request("screen");
-    } catch (_) {}
+      const s = localStorage.getItem(STORAGE_KEY);
+      return s ? normalize(JSON.parse(s)) : null;
+    } catch (_) { return null; }
+  }
+
+  function fetchPlaylist() {
+    const req = fetch(PLAYLIST_URL + "?t=" + Date.now(), { cache: "no-store" }).then((res) => {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    });
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("tidsavbrudd")), FETCH_TIMEOUT_MS));
+    return Promise.race([req, timeout]);
+  }
+
+  function loadPlaylist() {
+    if (loading) return;
+    loading = true;
+    fetchPlaylist().then(normalize).then((pl) => {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(pl)); } catch (_) {}
+      apply(pl);
+      warmImages();
+    }).catch((err) => {
+      const msg = (err && err.message) || String(err);
+      if (playlistSig === null) {
+        const saved = readSaved();
+        if (saved) {
+          apply(saved);
+          warmImages();
+          setStatus("Bruker lagret spilliste (" + msg + ")", true);
+          return;
+        }
+        placeholder.classList.add("show");
+        setStatus("Kunne ikke laste playlist.json (" + msg + ")", true);
+        return;
+      }
+      setStatus("Beholder forrige spilliste (" + msg + ")", true);
+    }).then(() => { loading = false; });
+  }
+
+  // ---- TV niceties ----
+
+  let wakeLock = null;
+  let wakeLockPending = false;
+  function requestWakeLock() {
+    if (!WAKE_LOCK || wakeLock || wakeLockPending || !("wakeLock" in navigator)) return;
+    if (document.visibilityState !== "visible") return;
+    wakeLockPending = true;
+    navigator.wakeLock.request("screen").then((lock) => {
+      wakeLock = lock;
+      lock.addEventListener("release", () => { wakeLock = null; });
+    }, () => {}).then(() => { wakeLockPending = false; });
+  }
+
+  function enterFullscreen() {
+    const de = document.documentElement;
+    const req = de.requestFullscreen || de.webkitRequestFullscreen;
+    if (!req || document.fullscreenElement || document.webkitFullscreenElement) return;
+    const p = req.call(de);
+    if (p && p.catch) p.catch(() => {});
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") tryWakeLock();
+    if (document.visibilityState !== "visible") return;
+    requestWakeLock();
+    const v = layers[front].querySelector("video");
+    if (v && v.paused && !v.ended) {
+      const p = v.play();
+      if (p && p.catch) p.catch(() => {});
+    }
+  });
+  window.addEventListener("online", loadPlaylist);
+
+  // Remote: OK / → next, ← previous, F fullscreen
+  document.addEventListener("keydown", (e) => {
+    const k = e.key || "";
+    const c = e.keyCode;
+    if (k === "ArrowRight" || k === "Enter" || k === " " || k === "MediaTrackNext" || c === 39 || c === 13 || c === 32) step(1);
+    else if (k === "ArrowLeft" || k === "MediaTrackPrevious" || c === 37) step(-1);
+    else if (k === "f" || k === "F") enterFullscreen();
+    else return;
+    e.preventDefault();
+    lastKeyAt = Date.now();
+    requestWakeLock();
   });
 
-  loadPlaylist(true).then(() => {
-    if (items.length) goTo(0);
+  // Tap/click advances (handy while testing); the first one also requests fullscreen
+  document.addEventListener("click", () => {
+    if (Date.now() - lastKeyAt < 600) return; // OK on a remote may also synthesise a click
+    enterFullscreen();
+    requestWakeLock();
+    step(1);
   });
-  setInterval(() => loadPlaylist(false), REFRESH_MS);
-  tryWakeLock();
 
-  // Tap/click advances (handy while testing)
-  document.body.addEventListener("click", () => {
-    if (items.length) goTo(index + 1);
-  });
+  loadPlaylist();
+  setInterval(loadPlaylist, REFRESH_MS);
+  requestWakeLock();
 })();
   </script>
 </body>
